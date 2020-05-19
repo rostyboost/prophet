@@ -35,7 +35,7 @@ def get_backends_from_env() -> List[str]:
 def build_models(target_dir):
     from fbprophet.models import StanBackendEnum
     for backend in get_backends_from_env():
-        StanBackendEnum.get_backend_class(backend).build_model(target_dir, MODEL_DIR)
+        StanBackendEnum.get_backend_class(backend).build_models(target_dir, MODEL_DIR)
 
 
 class BuildPyCommand(build_py):

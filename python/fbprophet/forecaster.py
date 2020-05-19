@@ -27,6 +27,8 @@ class Prophet(object):
 
     Parameters
     ----------
+    distribution: String 'gaussian' or 'gamma' to specify distributional
+        assumption.
     growth: String 'linear' or 'logistic' to specify a linear or logistic
         trend.
     changepoints: List of dates at which to include potential changepoints. If
@@ -77,6 +79,7 @@ class Prophet(object):
 
     def __init__(
             self,
+            distribution='gaussian',
             growth='linear',
             changepoints=None,
             n_changepoints=25,
@@ -94,6 +97,7 @@ class Prophet(object):
             uncertainty_samples=1000,
             stan_backend=None
     ):
+        self.distribution = distribution
         self.growth = growth
 
         self.changepoints = changepoints
@@ -138,23 +142,26 @@ class Prophet(object):
         self.train_holiday_names = None
         self.fit_kwargs = {}
         self.validate_inputs()
-        self._load_stan_backend(stan_backend)
+        self._load_stan_backend(stan_backend, distribution)
 
-    def _load_stan_backend(self, stan_backend):
+    def _load_stan_backend(self, stan_backend, distribution):
         if stan_backend is None:
             for i in StanBackendEnum:
                 try:
                     logger.debug("Trying to load backend: %s", i.name)
-                    return self._load_stan_backend(i.name)
+                    return self._load_stan_backend(i.name, distribution)
                 except Exception as e:
                     logger.debug("Unable to load backend %s (%s), trying the next one", i.name, e)
         else:
-            self.stan_backend = StanBackendEnum.get_backend_class(stan_backend)()
+            self.stan_backend = StanBackendEnum.get_backend_class(stan_backend)(distribution)
 
         logger.debug("Loaded stan backend: %s", self.stan_backend.get_type())
 
     def validate_inputs(self):
         """Validates the inputs to Prophet."""
+        if self.distribution not in ('gaussian', 'gamma'):
+            raise ValueError(
+                'Parameter "growth" should be "gaussian" or "gamma".')
         if self.growth not in ('linear', 'logistic'):
             raise ValueError(
                 'Parameter "growth" should be "linear" or "logistic".')
@@ -984,7 +991,7 @@ class Prophet(object):
             }
 
     @staticmethod
-    def linear_growth_init(df):
+    def linear_growth_init(df, distribution_type):
         """Initialize linear growth.
 
         Provides a strong initialization for linear growth by calculating the
@@ -1001,29 +1008,37 @@ class Prophet(object):
         A tuple (k, m) with the rate (k) and offset (m) of the linear growth
         function.
         """
-        from math import log, exp
-        from scipy.optimize import fsolve
         i0, i1 = df['ds'].idxmin(), df['ds'].idxmax()
-        t0, t1 = df['t'].iloc[i0], df['t'].iloc[i1]
-        y0, y1 = df['y_scaled'].iloc[i0], df['y_scaled'].iloc[i1]
-        var = df['y_scaled'].var()
         
-        def log1exp(x):
-            if x > 20:
-                return x
-            return log(1+ exp(x))
+        if distribution_type == 'gaussian':
+            T = df['t'].iloc[i1] - df['t'].iloc[i0]
+            k = (df['y_scaled'].iloc[i1] - df['y_scaled'].iloc[i0]) / T
+            m = df['y_scaled'].iloc[i0] - k * df['t'].iloc[i0]
+            return (k, m)
         
-        def eqs(p):
-            k_a, m_a, k_b, m_b = p
-            alpha0 = log1exp(m_a + k_a *t0)
-            alpha1 = log1exp(m_a + k_a *t1)
-            beta0 = log1exp(m_b + k_b *t0)
-            beta1 = log1exp(m_b + k_b *t1)
-            return (alpha0/beta0 - y0, alpha1/beta1 - y1, alpha0/(beta0*beta0) - var, alpha1/(beta1*beta1) - var)
-        
-        k_a, m_a, k_b, m_b = fsolve(eqs, (-1,1,-1,1))
+        else:
+            from math import log, exp
+            from scipy.optimize import fsolve
+            t0, t1 = df['t'].iloc[i0], df['t'].iloc[i1]
+            y0, y1 = df['y_scaled'].iloc[i0], df['y_scaled'].iloc[i1]
+            var = df['y_scaled'].var()
 
-        return (k_a, m_a, k_b, m_b)
+            def log1exp(x):
+                if x > 20:
+                    return x
+                return log(1+ exp(x))
+
+            def eqs(p):
+                k_a, m_a, k_b, m_b = p
+                alpha0 = log1exp(m_a + k_a *t0)
+                alpha1 = log1exp(m_a + k_a *t1)
+                beta0 = log1exp(m_b + k_b *t0)
+                beta1 = log1exp(m_b + k_b *t1)
+                return (alpha0/beta0 - y0, alpha1/beta1 - y1, alpha0/(beta0*beta0) - var, alpha1/(beta1*beta1) - var)
+
+            k_a, m_a, k_b, m_b = fsolve(eqs, (-1,1,-1,1))
+
+            return (k_a, m_a, k_b, m_b)
 
     @staticmethod
     def logistic_growth_init(df):
@@ -1133,20 +1148,30 @@ class Prophet(object):
 
         if self.growth == 'linear':
             dat['cap'] = np.zeros(self.history.shape[0])
-            kinit = self.linear_growth_init(history)
+            kinit = self.linear_growth_init(history, self.distribution)
         else:
             dat['cap'] = history['cap_scaled']
             kinit = self.logistic_growth_init(history)
 
-        stan_init = {
-            'k_a': kinit[0],
-            'm_a': kinit[1],
-            'k_b': kinit[2],
-            'm_b': kinit[3],
-            'delta': np.zeros(len(self.changepoints_t)),
-            'alpha': 0.5 * np.ones(seasonal_features.shape[1]),
-            'beta': 0.5 * np.ones(seasonal_features.shape[1])
-        }
+        if self.distribution == 'gaussian':
+            stan_init = {
+                'k': kinit[0],
+                'm': kinit[1],
+                'delta': np.zeros(len(self.changepoints_t)),
+                'beta': np.zeros(seasonal_features.shape[1]),
+                'sigma_obs': 1
+            }
+        
+        else:
+            stan_init = {
+                'k_a': kinit[0],
+                'm_a': kinit[1],
+                'k_b': kinit[2],
+                'm_b': kinit[3],
+                'delta': np.zeros(len(self.changepoints_t)),
+                'alpha': 0.5 * np.ones(seasonal_features.shape[1]),
+                'beta': 0.5 * np.ones(seasonal_features.shape[1])
+            }
 
         if (history['y'].min() == history['y'].max()
             and self.growth == 'linear'):
@@ -1193,30 +1218,49 @@ class Prophet(object):
                 raise ValueError('Dataframe has no rows.')
             df = self.setup_dataframe(df.copy())
 
-        trend_alpha, trend_beta = self.predict_trends(df)
-        df['trend_alpha'] = trend_alpha
-        df['trend_beta'] = trend_beta
-        df['yscale'] = self.y_scale
-        seasonal_components = self.predict_seasonal_components(df)
+        if self.distribution == 'gaussian':
+            trend = self.predict_trend_gaussian(df)
+            df['trend'] = trend
+            seasonal_components = self.predict_seasonal_components_gaussian(df)
+        else:
+            trend_alpha, trend_beta = self.predict_trends_gamma(df)
+            df['trend_alpha'] = trend_alpha
+            df['trend_beta'] = trend_beta
+            df['yscale'] = self.y_scale
+            seasonal_components = self.predict_seasonal_components_gamma(df)
+        
         if self.uncertainty_samples:
             intervals = self.predict_uncertainty(df)
         else:
             intervals = None
 
         # Drop columns except ds, cap, floor, and trend
-        cols = ['ds', 'trend_alpha', 'trend_beta', 'yscale']
+        if self.distribution == 'gaussian':
+            cols = ['ds', 'trend']
+            if 'cap' in df:
+                cols.append('cap')
+            if self.logistic_floor:
+                cols.append('floor')
+        else:
+            cols = ['ds', 'trend_alpha', 'trend_beta', 'yscale']
         # Add in forecast components
         df2 = pd.concat((df[cols], intervals, seasonal_components), axis=1)
         
-        alphas = np.log(1 + np.exp(
-                df2['trend_alpha'] * (1 + df2['multiplicative_terms_alpha'])
-                + df2['additive_terms_alpha']))
-        
-        betas = np.log(1 + np.exp(
-                df2['trend_beta'] * (1 + df2['multiplicative_terms_beta'])
-                + df2['additive_terms_beta']))
-        
-        df2['yhat'] = np.divide(alphas, betas) * self.y_scale
+        if self.distribution == 'gaussian':
+            df2['yhat'] = (
+                df2['trend'] * (1 + df2['multiplicative_terms'])
+                + df2['additive_terms']
+            )
+        else:
+            alphas = np.log(1 + np.exp(
+                    df2['trend_alpha'] * (1 + df2['multiplicative_terms_alpha'])
+                    + df2['additive_terms_alpha']))
+
+            betas = np.log(1 + np.exp(
+                    df2['trend_beta'] * (1 + df2['multiplicative_terms_beta'])
+                    + df2['additive_terms_beta']))
+
+            df2['yhat'] = np.divide(alphas, betas) * self.y_scale
         
         return df2
 
@@ -1281,7 +1325,32 @@ class Prophet(object):
             m_t[indx] += gammas[s]
         return cap / (1 + np.exp(-k_t * (t - m_t)))
 
-    def predict_trends(self, df):
+    def predict_trend_gaussian(self, df):
+        """Predict trend using the prophet model.
+
+        Parameters
+        ----------
+        df: Prediction dataframe.
+
+        Returns
+        -------
+        Vector with trend on prediction dates.
+        """
+        k = np.nanmean(self.params['k'])
+        m = np.nanmean(self.params['m'])
+        deltas = np.nanmean(self.params['delta'], axis=0)
+
+        t = np.array(df['t'])
+        if self.growth == 'linear':
+            trend = self.piecewise_linear(t, deltas, k, m, self.changepoints_t)
+        else:
+            cap = df['cap_scaled']
+            trend = self.piecewise_logistic(
+                t, cap, deltas, k, m, self.changepoints_t)
+
+        return trend * self.y_scale + df['floor']
+    
+    def predict_trends_gamma(self, df):
         """Predict trend using the prophet model.
 
         Parameters
@@ -1303,8 +1372,42 @@ class Prophet(object):
         trend_beta = self.piecewise_linear(t, deltas, k_b, m_b, self.changepoints_t)
 
         return trend_alpha, trend_beta
+    
+    def predict_seasonal_components_gaussian(self, df):
+        """Predict seasonality components, holidays, and added regressors.
+        Parameters
+        ----------
+        df: Prediction dataframe.
+        Returns
+        -------
+        Dataframe with seasonal components.
+        """
+        seasonal_features, _, component_cols, _ = (
+            self.make_all_seasonality_features(df)
+        )
+        if self.uncertainty_samples:
+            lower_p = 100 * (1.0 - self.interval_width) / 2
+            upper_p = 100 * (1.0 + self.interval_width) / 2
 
-    def predict_seasonal_components(self, df):
+        X = seasonal_features.values
+        data = {}
+        for component in component_cols.columns:
+            beta_c = self.params['beta'] * component_cols[component].values
+
+            comp = np.matmul(X, beta_c.transpose())
+            if component in self.component_modes['additive']:
+                comp *= self.y_scale
+            data[component] = np.nanmean(comp, axis=1)
+            if self.uncertainty_samples:
+                data[component + '_lower'] = self.percentile(
+                    comp, lower_p, axis=1,
+                )
+                data[component + '_upper'] = self.percentile(
+                    comp, upper_p, axis=1,
+                )
+        return pd.DataFrame(data)
+
+    def predict_seasonal_components_gamma(self, df):
         """Predict seasonality components, holidays, and added regressors.
 
         Parameters
@@ -1352,7 +1455,7 @@ class Prophet(object):
         Dictionary with posterior predictive samples for the forecast yhat and
         for the trend component.
         """
-        n_iterations = self.params['k_a'].shape[0]
+        n_iterations = self.params['k' if self.distribution == 'gaussian' else 'k_a'].shape[0]
         samp_per_iter = max(1, int(np.ceil(
             self.uncertainty_samples / float(n_iterations)
         )))
@@ -1362,15 +1465,20 @@ class Prophet(object):
             self.make_all_seasonality_features(df)
         )
 
-        sim_values = {'yhat': [], 'trend_alpha': [], 'trend_beta': []}
+        if self.distribution == 'gaussian':
+            sim_values = {'yhat': [], 'trend': []}
+            sample_model = self.sample_model_gaussian
+        else:
+            sim_values = {'yhat': [], 'trend_alpha': [], 'trend_beta': []}
+            sample_model = self.sample_model_gamma
         for i in range(n_iterations):
             for _j in range(samp_per_iter):
-                sim = self.sample_model(
+                sim = sample_model(
                     df=df,
                     seasonal_features=seasonal_features,
                     iteration=i,
                     s_a=component_cols['additive_terms'],
-                    s_m=component_cols['multiplicative_terms']
+                    s_m=component_cols['multiplicative_terms'],
                 )
                 for key in sim_values:
                     sim_values[key].append(sim[key])
@@ -1412,7 +1520,11 @@ class Prophet(object):
         upper_p = 100 * (1.0 + self.interval_width) / 2
 
         series = {}
-        for key in ['yhat', 'trend_alpha', 'trend_beta']:
+        if self.distribution == 'gaussian':
+            trend_keys = ['trend']
+        else:
+            trend_keys = ['trend_alpha', 'trend_beta']
+        for key in ['yhat'] + trend_keys :
             series['{}_lower'.format(key)] = self.percentile(
                 sim_values[key], lower_p, axis=1)
             series['{}_upper'.format(key)] = self.percentile(
@@ -1420,7 +1532,35 @@ class Prophet(object):
 
         return pd.DataFrame(series)
 
-    def sample_model(self, df, seasonal_features, iteration, s_a, s_m):
+    def sample_model_gaussian(self, df, seasonal_features, iteration, s_a, s_m):
+        """Simulate observations from the extrapolated generative model.
+        Parameters
+        ----------
+        df: Prediction dataframe.
+        seasonal_features: pd.DataFrame of seasonal features.
+        iteration: Int sampling iteration to use parameters from.
+        s_a: Indicator vector for additive components
+        s_m: Indicator vector for multiplicative components
+        Returns
+        -------
+        Dataframe with trend and yhat, each like df['t'].
+        """
+        trend = self.sample_predictive_trends(df, iteration)
+
+        beta = self.params['beta'][iteration]
+        Xb_a = np.matmul(seasonal_features.values,
+                         beta * s_a.values) * self.y_scale
+        Xb_m = np.matmul(seasonal_features.values, beta * s_m.values)
+
+        sigma = self.params['sigma_obs'][iteration]
+        noise = np.random.normal(0, sigma, df.shape[0]) * self.y_scale
+
+        return pd.DataFrame({
+            'yhat': trend * (1 + Xb_m) + Xb_a + noise,
+            'trend': trend
+        })
+
+    def sample_model_gamma(self, df, seasonal_features, iteration, s_a, s_m):
         """Simulate observations from the extrapolated generative model.
 
         Parameters
@@ -1471,10 +1611,6 @@ class Prophet(object):
         -------
         np.array of simulated trend over df['t'].
         """
-        k_a = self.params['k_a'][iteration]
-        m_a = self.params['m_a'][iteration]
-        k_b = self.params['k_b'][iteration]
-        m_b = self.params['m_b'][iteration]
         deltas = self.params['delta'][iteration]
 
         t = np.array(df['t'])
@@ -1502,16 +1638,26 @@ class Prophet(object):
         changepoint_ts = np.concatenate((self.changepoints_t,
                                          changepoint_ts_new))
         deltas = np.concatenate((deltas, deltas_new))
+        
+        if self.distribution == 'gaussian':
+            k = self.params['k'][iteration]
+            m = self.params['m'][iteration]
+            if self.growth == 'linear':
+                trend = self.piecewise_linear(t, deltas, k, m, changepoint_ts)
+            elif self.growth == 'logistic':
+                cap = df['cap_scaled']
+                trend = self.piecewise_logistic(t, cap, deltas, k, m,
+                                                changepoint_ts)
+            return trend * self.y_scale + df['floor']
 
-        #if self.growth == 'linear':
-        trend_alpha = self.piecewise_linear(t, deltas, k_a, m_a, changepoint_ts)
-        trend_beta = self.piecewise_linear(t, deltas, k_b, m_b, changepoint_ts)
-        #else:
-        #    cap = df['cap_scaled']
-        #    trend = self.piecewise_logistic(t, cap, deltas, k, m,
-        #                                    changepoint_ts)
-
-        return trend_alpha, trend_beta
+        else:
+            k_a = self.params['k_a'][iteration]
+            m_a = self.params['m_a'][iteration]
+            k_b = self.params['k_b'][iteration]
+            m_b = self.params['m_b'][iteration]
+            trend_alpha = self.piecewise_linear(t, deltas, k_a, m_a, changepoint_ts)
+            trend_beta = self.piecewise_linear(t, deltas, k_b, m_b, changepoint_ts)
+            return trend_alpha, trend_beta
 
     def percentile(self, a, *args, **kwargs):
         """

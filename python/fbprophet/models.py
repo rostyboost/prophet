@@ -18,7 +18,12 @@ logger = logging.getLogger('fbprophet.models')
 
 
 class IStanBackend(ABC):
-    def __init__(self):
+    def __init__(self, model_type):
+        self.model_type = model_type
+        self.model_type2model_name = {
+            'gaussian': 'prophet',
+            'gamma': 'gamma_prophet'
+        }
         self.model = self.load_model()
         self.stan_fit = None
 
@@ -26,6 +31,10 @@ class IStanBackend(ABC):
     @abstractmethod
     def get_type():
         pass
+    
+    @staticmethod
+    def get_model_type():
+        return self.model_type
 
     @abstractmethod
     def load_model(self):
@@ -41,7 +50,7 @@ class IStanBackend(ABC):
 
     @staticmethod
     @abstractmethod
-    def build_model(target_dir, model_dir):
+    def build_models(target_dir, model_dir):
         pass
 
 
@@ -205,15 +214,17 @@ class PyStanBackend(IStanBackend):
         return StanBackendEnum.PYSTAN.name
 
     @staticmethod
-    def build_model(target_dir, model_dir):
+    def build_models(target_dir, model_dir):
         import pystan
-        model_name = 'gamma_prophet.stan'
-        target_name = 'prophet_model.pkl'
-        with open(os.path.join(model_dir, model_name)) as f:
-            model_code = f.read()
-        sm = pystan.StanModel(model_code=model_code)
-        with open(os.path.join(target_dir, target_name), 'wb') as f:
-            pickle.dump(sm, f, protocol=pickle.HIGHEST_PROTOCOL)
+        for model_base_name in ['prophet', 'gamma_prophet']:
+            model_name = '{}.stan'.format(model_base_name)
+            logger.info('Compiling {}...'.format(model_name))
+            target_name = '{}.pkl'.format(model_base_name)
+            with open(os.path.join(model_dir, model_name)) as f:
+                model_code = f.read()
+            sm = pystan.StanModel(model_code=model_code)
+            with open(os.path.join(target_dir, target_name), 'wb') as f:
+                pickle.dump(sm, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     def sampling(self, stan_init, stan_data, samples, **kwargs) -> dict:
 
@@ -259,10 +270,10 @@ class PyStanBackend(IStanBackend):
         return params
 
     def load_model(self):
-        """Load compiled Stan model"""
+        """Load compiled Stan model"""        
         model_file = pkg_resources.resource_filename(
             'fbprophet',
-            'stan_model/prophet_model.pkl',
+            'stan_model/{}.pkl'.format(self.model_type2model_name[self.model_type]),
         )
         with open(model_file, 'rb') as f:
             return pickle.load(f)
