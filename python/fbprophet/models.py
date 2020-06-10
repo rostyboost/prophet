@@ -22,7 +22,8 @@ class IStanBackend(ABC):
         self.model_type = model_type
         self.model_type2model_name = {
             'gaussian': 'prophet',
-            'gamma': 'gamma_prophet'
+            'gamma': 'gamma_prophet',
+            'gamma2': 'gamma2_prophet'
         }
         self.model = self.load_model()
         self.stan_fit = None
@@ -216,7 +217,7 @@ class PyStanBackend(IStanBackend):
     @staticmethod
     def build_models(target_dir, model_dir):
         import pystan
-        for model_base_name in ['prophet', 'gamma_prophet']:
+        for model_base_name in ['prophet', 'gamma_prophet', 'gamma2_prophet']:
             model_name = '{}.stan'.format(model_base_name)
             logger.info('Compiling {}...'.format(model_name))
             target_name = '{}.pkl'.format(model_base_name)

@@ -159,7 +159,7 @@ class Prophet(object):
 
     def validate_inputs(self):
         """Validates the inputs to Prophet."""
-        if self.distribution not in ('gaussian', 'gamma'):
+        if self.distribution not in ('gaussian', 'gamma', 'gamma2'):
             raise ValueError(
                 'Parameter "growth" should be "gaussian" or "gamma".')
         if self.growth not in ('linear', 'logistic'):
@@ -1015,8 +1015,7 @@ class Prophet(object):
             k = (df['y_scaled'].iloc[i1] - df['y_scaled'].iloc[i0]) / T
             m = df['y_scaled'].iloc[i0] - k * df['t'].iloc[i0]
             return (k, m)
-        
-        else:
+        elif distribution_type == 'gamma':
             from math import log, exp
             from scipy.optimize import fsolve
             t0, t1 = df['t'].iloc[i0], df['t'].iloc[i1]
@@ -1034,6 +1033,29 @@ class Prophet(object):
                 alpha1 = log1exp(m_a + k_a *t1)
                 beta0 = log1exp(m_b + k_b *t0)
                 beta1 = log1exp(m_b + k_b *t1)
+                return (alpha0/beta0 - y0, alpha1/beta1 - y1, alpha0/(beta0*beta0) - var, alpha1/(beta1*beta1) - var)
+
+            k_a, m_a, k_b, m_b = fsolve(eqs, (-1,1,-1,1))
+
+            return (k_a, m_a, k_b, m_b)
+        elif distribution_type == 'gamma2':
+            from math import log, exp
+            from scipy.optimize import fsolve
+            t0, t1 = df['t'].iloc[i0], df['t'].iloc[i1]
+            y0, y1 = df['y_scaled'].iloc[i0], df['y_scaled'].iloc[i1]
+            var = df['y_scaled'].var()
+
+            def log1exp(x):
+                if x > 20:
+                    return x
+                return log(1+ exp(x))
+
+            def eqs(p):
+                k_a, m_a, k_b, m_b = p
+                alpha0 = log1exp(m_a + k_a *t0) * log1exp(m_a + k_a *t0) / log1exp(m_b + k_b *t0)
+                alpha1 = log1exp(m_a + k_a *t1) * log1exp(m_a + k_a *t1) / log1exp(m_b + k_b *t1)
+                beta0 = log1exp(m_a + k_a *t0) / log1exp(m_b + k_b *t0)
+                beta1 = log1exp(m_a + k_a *t1) / log1exp(m_b + k_b *t1)
                 return (alpha0/beta0 - y0, alpha1/beta1 - y1, alpha0/(beta0*beta0) - var, alpha1/(beta1*beta1) - var)
 
             k_a, m_a, k_b, m_b = fsolve(eqs, (-1,1,-1,1))
@@ -1222,10 +1244,16 @@ class Prophet(object):
             trend = self.predict_trend_gaussian(df)
             df['trend'] = trend
             seasonal_components = self.predict_seasonal_components_gaussian(df)
-        else:
+        elif self.distribution == 'gamma':
             trend_alpha, trend_beta = self.predict_trends_gamma(df)
             df['trend_alpha'] = trend_alpha
             df['trend_beta'] = trend_beta
+            df['yscale'] = self.y_scale
+            seasonal_components = self.predict_seasonal_components_gamma(df)
+        elif self.distribution == 'gamma2':
+            trend_mean, trend_var = self.predict_trends_gamma(df)
+            df['trend_mean'] = trend_mean
+            df['trend_var'] = trend_var
             df['yscale'] = self.y_scale
             seasonal_components = self.predict_seasonal_components_gamma(df)
         
@@ -1241,8 +1269,10 @@ class Prophet(object):
                 cols.append('cap')
             if self.logistic_floor:
                 cols.append('floor')
-        else:
+        elif self.distribution == 'gamma':
             cols = ['ds', 'trend_alpha', 'trend_beta', 'yscale']
+        elif self.distribution == 'gamma2':
+            cols = ['ds', 'trend_mean', 'trend_var', 'yscale']
         # Add in forecast components
         df2 = pd.concat((df[cols], intervals, seasonal_components), axis=1)
         
@@ -1251,7 +1281,7 @@ class Prophet(object):
                 df2['trend'] * (1 + df2['multiplicative_terms'])
                 + df2['additive_terms']
             )
-        else:
+        elif self.distribution == 'gamma':
             alphas = np.log(1 + np.exp(
                     df2['trend_alpha'] * (1 + df2['multiplicative_terms_alpha'])
                     + df2['additive_terms_alpha']))
@@ -1261,6 +1291,12 @@ class Prophet(object):
                     + df2['additive_terms_beta']))
 
             df2['yhat'] = np.divide(alphas, betas) * self.y_scale
+        elif self.distribution == 'gamma2':
+            p1 = np.log(1 + np.exp(
+                    df2['trend_mean'] * (1 + df2['multiplicative_terms_alpha'])
+                    + df2['additive_terms_alpha']))
+
+            df2['yhat'] = p1 * self.y_scale            
         
         return df2
 
@@ -1468,9 +1504,12 @@ class Prophet(object):
         if self.distribution == 'gaussian':
             sim_values = {'yhat': [], 'trend': []}
             sample_model = self.sample_model_gaussian
-        else:
+        elif self.distribution == 'gamma':
             sim_values = {'yhat': [], 'trend_alpha': [], 'trend_beta': []}
             sample_model = self.sample_model_gamma
+        elif self.distribution == 'gamma2':
+            sim_values = {'yhat': [], 'trend_mean': [], 'trend_var': []}
+            sample_model = self.sample_model_gamma2
         for i in range(n_iterations):
             for _j in range(samp_per_iter):
                 sim = sample_model(
@@ -1522,8 +1561,10 @@ class Prophet(object):
         series = {}
         if self.distribution == 'gaussian':
             trend_keys = ['trend']
-        else:
+        elif self.distribution == 'gamma':
             trend_keys = ['trend_alpha', 'trend_beta']
+        elif self.distribution == 'gamma2':
+            trend_keys = ['trend_mean', 'trend_var']
         for key in ['yhat'] + trend_keys :
             series['{}_lower'.format(key)] = self.percentile(
                 sim_values[key], lower_p, axis=1)
@@ -1597,6 +1638,44 @@ class Prophet(object):
             'yhat': np.random.gamma(alpha_draws, 1.0/beta_draws, df.shape[0]) * self.y_scale,
             'trend_alpha': trend_alpha,
             'trend_beta': trend_beta
+        })
+    
+    def sample_model_gamma2(self, df, seasonal_features, iteration, s_a, s_m):
+        """Simulate observations from the extrapolated generative model.
+
+        Parameters
+        ----------
+        df: Prediction dataframe.
+        seasonal_features: pd.DataFrame of seasonal features.
+        iteration: Int sampling iteration to use parameters from.
+        s_a: Indicator vector for additive components
+        s_m: Indicator vector for multiplicative components
+
+        Returns
+        -------
+        Dataframe with trend and yhat, each like df['t'].
+        """
+        trend_mean, trend_var = self.sample_predictive_trends(df, iteration)
+
+        a = self.params['alpha'][iteration]
+        b = self.params['beta'][iteration]
+        Xb_aa = np.matmul(seasonal_features.values,
+                         a * s_a.values)
+        Xb_ma = np.matmul(seasonal_features.values, a * s_m.values)
+        
+        Xb_ab = np.matmul(seasonal_features.values,
+                         b * s_a.values)
+        Xb_mb = np.matmul(seasonal_features.values, b * s_m.values)
+        
+        mean_draws =  np.log(1 + np.exp(trend_mean * (1 + Xb_ma) + Xb_aa))
+        var_draws =  np.log(1 + np.exp(trend_var * (1 + Xb_mb) + Xb_ab))
+        alpha_draws = np.divide(np.multiply(mean_draws, mean_draws), var_draws)
+        beta_draws = np.divide(mean_draws, var_draws)
+
+        return pd.DataFrame({
+            'yhat': np.random.gamma(alpha_draws, 1.0/beta_draws, df.shape[0]) * self.y_scale,
+            'trend_mean': trend_mean,
+            'trend_var': trend_var
         })
 
     def sample_predictive_trends(self, df, iteration):
