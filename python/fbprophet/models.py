@@ -23,7 +23,10 @@ class IStanBackend(ABC):
         self.model_type2model_name = {
             'gaussian': 'prophet',
             'gamma': 'gamma_prophet',
-            'gamma2': 'gamma2_prophet'
+            'gamma2': 'gamma2_prophet',
+            'gamma3': 'gamma3_prophet',
+            'gamma4': 'gamma4_prophet',
+            'gamma5': 'gamma5_prophet'
         }
         self.model = self.load_model()
         self.stan_fit = None
@@ -217,7 +220,7 @@ class PyStanBackend(IStanBackend):
     @staticmethod
     def build_models(target_dir, model_dir):
         import pystan
-        for model_base_name in ['prophet', 'gamma_prophet', 'gamma2_prophet']:
+        for model_base_name in ['gamma5_prophet']:#['prophet', 'gamma_prophet', 'gamma2_prophet', 'gamma3_prophet', 'gamma4_prophet', 'gamma5_prophet']:
             model_name = '{}.stan'.format(model_base_name)
             logger.info('Compiling {}...'.format(model_name))
             target_name = '{}.pkl'.format(model_base_name)
@@ -240,7 +243,7 @@ class PyStanBackend(IStanBackend):
         for par in self.stan_fit.model_pars:
             out[par] = self.stan_fit[par]
             # Shape vector parameters
-            if par in ['delta', 'beta'] and len(out[par].shape) < 2:
+            if par in ['delta', 'beta', 'alpha', 'delta_a', 'delta_b', 'alpha_sig', 'beta_sig'] and len(out[par].shape) < 2:
                 out[par] = out[par].reshape((-1, 1))
         return out
 
